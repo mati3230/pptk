@@ -28,6 +28,7 @@
 #include "point_cloud.h"
 #include "qt_camera.h"
 #include "selection_box.h"
+#include "lasso.h"
 #include "text.h"
 #include "timer.h"
 
@@ -61,6 +62,8 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     _look_at = new LookAt(this, _context);
     _points = new PointCloud(this, _context);
     _selection_box = new SelectionBox(this, _context);
+    _lasso = new Lasso(this, _context);
+    _selection_mode = NONE;
     _text = new Text(this, _context, font);
     _dolly = new CameraDolly();
 
@@ -98,6 +101,23 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     comm::sendBytes((const char*)&serverPort, sizeof(quint16), socket);
     */
     socket->disconnectFromHost();
+
+    qDebug("init");
+    qDebug("!!!add random points!!!");
+    int numPoints = 100;
+    std::vector<float> positions;
+    for (int i = 0; i < numPoints * 3; i++){
+        float c = rand();
+        positions.push_back(c);
+    }
+
+    _points->loadPoints(positions);
+
+    _camera = QtCamera(_points->getBox());
+    _camera.setAspectRatio((float)width() / height());
+    _floor_grid->setFloorLevel(_points->getFloor());
+    renderPoints();
+    renderPointsFine();
   }
 
   ~Viewer() {
@@ -106,6 +126,7 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     delete _look_at;
     delete _points;
     delete _selection_box;
+    delete _lasso;
     delete _text;
     delete _dolly;
 
@@ -188,19 +209,32 @@ class Viewer : public QWindow, protected OpenGLFuncs {
   virtual void mousePressEvent(QMouseEvent* ev) {
     _dolly->stop();
     if (ev->buttons() & Qt::LeftButton) {
-      _pressPos = ev->windowPos();
-      if (ev->modifiers() & Qt::ControlModifier) {
-        if (ev->modifiers() & Qt::ShiftModifier)
-          _selection_box->click(win2ndc(_pressPos), SelectionBox::SUB);
-        else
-          _selection_box->click(win2ndc(_pressPos), SelectionBox::ADD);
+        _pressPos = ev->windowPos();
+        if (ev->modifiers() & Qt::ControlModifier) {
+            _selection_mode = BOX;
+            if (ev->modifiers() & Qt::ShiftModifier)
+              _selection_box->click(win2ndc(_pressPos), SelectionBox::SUB);
+            else
+              _selection_box->click(win2ndc(_pressPos), SelectionBox::ADD);
+        }
+        else if (ev->modifiers() & Qt::AltModifier) {
+            //qDebug("click entered");
+            _selection_mode = LASSO;
+            if (ev->modifiers() & Qt::ShiftModifier)
+              _lasso->click(win2ndc(_pressPos), Lasso::SUB);
+            else
+              _lasso->click(win2ndc(_pressPos), Lasso::ADD);
+        }
         renderPoints();
-      }
-    } else if (ev->buttons() & Qt::RightButton) {
-      _points->clearSelected();
-      renderPoints();
-    } else {
-      QWindow::mousePressEvent(ev);
+    }
+    else if (ev->buttons() & Qt::RightButton)
+    {
+        _points->clearSelected();
+        renderPoints();
+    }
+    else
+    {
+        QWindow::mousePressEvent(ev);
     }
   }
 
@@ -208,16 +242,32 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     // note: +x right, +y down
     if (ev->buttons() & Qt::LeftButton) {
       if (_fine_render_state != INACTIVE) _fine_render_state = TERMINATE;
-      if (_selection_box->active()) {
-        _selection_box->drag(win2ndc(ev->windowPos()));
-      } else {
-        _camera.restore();
-        if (ev->modifiers() == Qt::ShiftModifier)
-          _camera.pan(QVector2D(ev->windowPos() - _pressPos) *
-                      QVector2D(2.0f / width(), 2.0f / height()));
-        else if (ev->modifiers() == Qt::NoModifier)
-          _camera.rotate(QVector2D(ev->windowPos() - _pressPos));
+      if (_selection_mode == BOX)
+      {
+          if (_selection_box->active()) {
+            _selection_box->drag(win2ndc(ev->windowPos()));
+          } else {
+            _camera.restore();
+            if (ev->modifiers() == Qt::ShiftModifier)
+              _camera.pan(QVector2D(ev->windowPos() - _pressPos) *
+                          QVector2D(2.0f / width(), 2.0f / height()));
+            else if (ev->modifiers() == Qt::NoModifier)
+              _camera.rotate(QVector2D(ev->windowPos() - _pressPos));
+          }
       }
+      else if(_selection_mode == LASSO){
+          if (_lasso->active()) {
+            _lasso->drag(win2ndc(ev->windowPos()));
+          } else {
+            _camera.restore();
+            if (ev->modifiers() == Qt::ShiftModifier)
+              _camera.pan(QVector2D(ev->windowPos() - _pressPos) *
+                          QVector2D(2.0f / width(), 2.0f / height()));
+            else if (ev->modifiers() == Qt::NoModifier)
+              _camera.rotate(QVector2D(ev->windowPos() - _pressPos));
+          }
+      }
+
       renderPoints();
     } else {
       QWindow::mouseMoveEvent(ev);
@@ -228,22 +278,43 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     Q_UNUSED(ev);
     QPointF releasePos = ev->windowPos();
     bool mouse_moved = releasePos != _pressPos;
-    if (_selection_box->active()) {
-      if (_selection_box->empty()) {
-        bool deselect = _selection_box->getType() == SelectionBox::SUB;
-        _points->selectNearPoint(releasePos, _camera, deselect);
-      } else {
-        _points->selectInBox(*_selection_box, _camera);
-      }
-      _selection_box->release();
-      renderPoints();
-      renderPointsFine();
-    } else {
-      if (mouse_moved) {
-        _camera.save();
-        renderPoints();
-        renderPointsFine();
-      }
+    if (_selection_mode == BOX){
+        if (_selection_box->active()) {
+          if (_selection_box->empty()) {
+            bool deselect = _selection_box->getType() == SelectionBox::SUB;
+            _points->selectNearPoint(releasePos, _camera, deselect);
+          } else {
+            _points->selectInBox(*_selection_box, _camera);
+          }
+          _selection_box->release();
+          renderPoints();
+          renderPointsFine();
+        } else {
+          if (mouse_moved) {
+            _camera.save();
+            renderPoints();
+            renderPointsFine();
+          }
+        }
+    }
+    else if (_selection_mode == LASSO){
+        if (_lasso->active()) {
+          if (_lasso->empty()) {
+            bool deselect = _lasso->getType() == Lasso::SUB;
+            _points->selectNearPoint(releasePos, _camera, deselect);
+          } else {
+            _points->selectInLasso(*_lasso, _camera);
+          }
+          _lasso->release();
+          renderPoints();
+          renderPointsFine();
+        } else {
+          if (mouse_moved) {
+            _camera.save();
+            renderPoints();
+            renderPointsFine();
+          }
+        }
     }
   }
 
@@ -656,7 +727,7 @@ class Viewer : public QWindow, protected OpenGLFuncs {
         _context->makeCurrent(this);
         if (chunk_size > 0)
           _points->draw(&_refined_indices[_chunk_offset],
-                        (unsigned int)chunk_size, _camera, _selection_box);
+                        (unsigned int)chunk_size, _camera, (int)_selection_mode, _selection_box, _lasso);
         _context->doneCurrent();
 #endif
         _chunk_offset += chunk_size;
@@ -866,9 +937,10 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     _render_time = vltools::getTime();
     _background->draw();
     _floor_grid->draw(_camera);
-    _points->draw(_camera, _selection_box);
+    _points->draw(_camera, (int) _selection_mode, _selection_box, _lasso);
     _look_at->draw(_camera);
     _selection_box->draw();
+    _lasso->draw();
     _render_time = vltools::getTime() - _render_time;
     displayInfo();
     if (this->isExposed()) _context->swapBuffers(this);
@@ -889,6 +961,7 @@ class Viewer : public QWindow, protected OpenGLFuncs {
   QtCamera _camera;
   FloorGrid* _floor_grid;
   SelectionBox* _selection_box;
+  Lasso* _lasso;
   PointCloud* _points;
   Background* _background;
   LookAt* _look_at;
@@ -897,7 +970,9 @@ class Viewer : public QWindow, protected OpenGLFuncs {
 
   float _dummy_accumulator;
   enum FineRenderState { INACTIVE, INITIALIZE, CHUNK, FINALIZE, TERMINATE };
+  enum SelectionMode { NONE, BOX, LASSO };
   FineRenderState _fine_render_state;
+  SelectionMode _selection_mode;
   QTimer* _timer_fine_render_delay;
   std::size_t _chunk_offset;
   std::size_t _max_chunk_size;

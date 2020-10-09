@@ -10,6 +10,7 @@
 #include "point_attributes.h"
 #include "qt_camera.h"
 #include "selection_box.h"
+#include "lasso.h"
 #include "timer.h"
 
 class PointCloud : protected OpenGLFuncs {
@@ -119,14 +120,14 @@ class PointCloud : protected OpenGLFuncs {
   void clearAttributes() { _attributes = PointAttributes(); }
 
   // render methods
-  void draw(const QtCamera& camera, const SelectionBox* box = NULL) {
+  void draw(const QtCamera& camera, int selection_mode, const SelectionBox* box = NULL, const Lasso* lasso = NULL) {
     queryLOD(_octree_ids, camera, 0.25f);
     if (_octree_ids.empty()) return;
-    draw(&_octree_ids[0], (unsigned int)_octree_ids.size(), camera, box);
+    draw(&_octree_ids[0], (unsigned int)_octree_ids.size(), camera, selection_mode, box, lasso);
   }
 
   void draw(const unsigned int* indices, const unsigned int num_points,
-            const QtCamera& camera, const SelectionBox* box = NULL) {
+            const QtCamera& camera, int selection_mode, const SelectionBox* box = NULL, const Lasso* lasso = NULL) {
     if (_num_points == 0) return;
 
     // box should be in normalized device coordinates
@@ -150,11 +151,17 @@ class PointCloud : protected OpenGLFuncs {
                        : QPointF());  // topLeft in Qt is bottom left in NDC
     _program.setUniformValue("box_max", box ? box->getBox().bottomRight()
                                             : QPointF());  // top right in NDC
+    QVector4D bounds = lasso->getBounds();
+    _program.setUniformValue("lasso_bounds_x", lasso ? QPointF(bounds.x(), bounds.y()) : QPointF());
+    _program.setUniformValue("lasso_bounds_y", lasso ? QPointF(bounds.z(), bounds.w()) : QPointF());
     _program.setUniformValue("eye", camera.getCameraPosition());
     _program.setUniformValue("view", camera.getViewVector());
     _program.setUniformValue("image_t", camera.getTop());
+    _program.setUniformValue("selection_mode", selection_mode);
     _program.setUniformValue("box_select_mode",
                              box ? box->getType() : SelectionBox::NONE);
+    _program.setUniformValue("lasso_select_mode",
+                          lasso ? lasso->getType() : Lasso::NONE);
     _program.setUniformValue("projection_mode", camera.getProjectionMode());
     _program.setUniformValue("color_map", 0);
     _program.setUniformValue("scalar_min", _color_map_min);
@@ -338,6 +345,29 @@ class PointCloud : protected OpenGLFuncs {
     updateSelectionMask();
   }
 
+  // selection methods
+  void selectInLasso(Lasso& lasso, const QtCamera& camera) {
+    if (lasso.getType() == Lasso::NONE) return;
+    QMatrix4x4 mvp = camera.computeMVPMatrix(_full_box);
+    std::vector<unsigned int> new_indices;
+    // check all centroids in addition to all points
+    for (unsigned int i = 0; i < _positions.size() / 3; i++) {
+      float* v = &_positions[3 * i];
+      QVector4D p(v[0], v[1], v[2], 1);
+      p = mvp * p;
+      p /= p.w();
+      bool in_lasso = lasso.contains(QPointF(p.x(), p.y()));
+      if (in_lasso && p.z() > -1.0f && p.z() < 1.0f){
+        new_indices.push_back(i);
+      }
+    }
+    if (lasso.getType() == Lasso::ADD)
+      mergeIndices(_selected_ids, new_indices);
+    else  // box.getType() == SelectionBox::SUB
+      removeIndices(_selected_ids, new_indices);
+    updateSelectionMask();
+  }
+
   void queryNearPoint(std::vector<unsigned int>& indices, const QPointF& point,
                       const QtCamera& camera) {
     Octree::ProjectionMode projection_mode =
@@ -445,8 +475,12 @@ class PointCloud : protected OpenGLFuncs {
         "uniform float height;\n"
         "uniform vec2 box_min;\n"
         "uniform vec2 box_max;\n"
+        "uniform vec2 lasso_bounds_x;\n"
+        "uniform vec2 lasso_bounds_y;\n"
         "uniform int draw_selection_box;\n"
+        "uniform int selection_mode;\n"
         "uniform int box_select_mode;  // 0 - add, 1 - remove, 2 - no box\n"
+        "uniform int lasso_select_mode;  // 0 - add, 1 - remove, 2 - no box\n"
         "uniform mat4 mvpMatrix;\n"
         "uniform sampler1D color_map;\n"
         "uniform float scalar_min;\n"
@@ -477,14 +511,27 @@ class PointCloud : protected OpenGLFuncs {
         "  tex_coord = (tex_coord - 0.5) * (color_map_n - 1.0) / color_map_n + 0.5;\n"
         "  vec4 color_s = tex_coord != tex_coord ? vec4(0, 0, 0, 1) : texture1D(color_map, tex_coord);\n"
         "  vec4 color_r = color_s * color;\n"
-        "  if (box_select_mode == 2)\n"
-        "    frag_color = selected == 1.0 ? vec4(1, 1, 0, 1) : color_r;\n"
-        "  else {\n"
-        "    bool inBox = p.x < box_max.x && p.x > box_min.x && p.y < box_max.y && p.y > box_min.y && p.z < 1.0 && p.z > -1.0;\n"
-        "    if (box_select_mode == 0)\n"
-        "      frag_color = (inBox || selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
-        "    else\n"
-        "      frag_color = (!inBox && selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
+        "  if (selection_mode == 1 || selection_mode == 0){\n"
+        "    if (box_select_mode == 2)\n"
+        "      frag_color = selected == 1.0 ? vec4(1, 1, 0, 1) : color_r;\n"
+        "    else {\n"
+        "      bool inBox = p.x < box_max.x && p.x > box_min.x && p.y < box_max.y && p.y > box_min.y && p.z < 1.0 && p.z > -1.0;\n"
+        "      if (box_select_mode == 0)\n"
+        "        frag_color = (inBox || selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
+        "      else\n"
+        "        frag_color = (!inBox && selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
+        "    }\n"
+        "  }\n"
+        "  else{\n"
+        "    if (lasso_select_mode == 2)\n"
+        "      frag_color = selected == 1.0 ? vec4(1, 1, 0, 1) : color_r;\n"
+        "    else{\n"
+        "      bool inLassoBox = (p.x < lasso_bounds_x.y) && (p.x > lasso_bounds_x.x) && (p.y < lasso_bounds_y.y) && (p.y > lasso_bounds_y.x) && (p.z < 1.0) && (p.z > -1.0);\n"
+        "      if (box_select_mode == 0)\n"
+        "        frag_color = (inLassoBox || selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
+        "      else\n"
+        "        frag_color = (!inLassoBox && selected == 1.0) ? vec4(1, 1, 0, 1) : color_r;\n"
+        "    }\n"
         "  }\n"
         "  float d = abs(dot(position.xyz - eye,view));\n"
         "  if (projection_mode == 1) d = 1.0;\n"
