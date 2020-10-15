@@ -103,6 +103,8 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     socket->disconnectFromHost();
 
     qDebug("init");
+    // uncomment to have a point cloud on start
+    /*
     qDebug("!!!add random points!!!");
     int numPoints = 100;
     std::vector<float> positions;
@@ -118,6 +120,7 @@ class Viewer : public QWindow, protected OpenGLFuncs {
     _floor_grid->setFloorLevel(_points->getFloor());
     renderPoints();
     renderPointsFine();
+    */
   }
 
   ~Viewer() {
